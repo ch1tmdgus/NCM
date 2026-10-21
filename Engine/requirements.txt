@@ -1,0 +1,6 @@
+pyautogui>=0.9.54,<1
+Pillow>=11,<13
+keyboard==0.13.5
+numpy>=2.2,<3
+mss>=10,<11
+pyinstaller>=6.16,<7
