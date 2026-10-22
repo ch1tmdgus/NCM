@@ -200,4 +200,112 @@ class EngineTests(unittest.TestCase):
             instance = bridge.Engine()
         self.assertFalse(instance.busy)
 
+
+    def test_nol_presets_replace_manual_colors_and_general_preserves_them(self):
+        self.configure()
+        manual = list(self.engine.target_colors)
+        self.engine.apply_settings(dict(site_mode='nol', selected_presets=['purple', 'blue', 'purple']))
+        self.assertEqual(self.engine.detection_colors(), [(208,202,246),(144,208,238)])
+        self.assertEqual(self.engine.selected_presets, ['purple','blue'])
+        self.engine.apply_settings(dict(site_mode='general'))
+        self.assertEqual(self.engine.detection_colors(), manual)
+        self.engine.apply_settings(dict(site_mode='nol', selected_presets=[]))
+        self.assertEqual(self.engine.detection_colors(), manual)
+
+    def test_nol_presets_allow_start_without_sampling_colors(self):
+        self.configure()
+        self.engine.target_colors = []
+        self.engine.start_wait_time.set(0)
+        self.engine.apply_settings(dict(site_mode='nol', selected_presets=['green','brown']))
+        self.assertTrue(self.engine.all_setup_notified)
+        with patch.object(self.engine, 'macro_loop') as scan:
+            self.engine.start()
+            self.wait_idle()
+            scan.assert_called_once()
+
+    def test_invalid_preset_is_rejected_without_changing_mode(self):
+        for presets in (['unknown'], 'purple', [True]):
+            with self.assertRaises(ValueError):
+                self.engine.apply_settings(dict(site_mode='nol', selected_presets=presets))
+            self.assertEqual(self.engine.site_mode, 'general')
+
+    def test_button_patch_handles_negative_monitor_coordinates(self):
+        self.engine.final_click_pos = (-200, 10)
+        sct = MagicMock()
+        sct.monitors = [dict(left=-1920, top=-100, width=3840, height=1180)]
+        sct.grab.return_value = np.full((9,9,4),(12,34,56,255),dtype=np.uint8)
+        np.testing.assert_array_equal(self.engine._grab_button_patch(sct),[12,34,56])
+        self.assertEqual(sct.grab.call_args.args[0],dict(left=-204,top=6,width=9,height=9))
+
+    def test_button_change_needs_two_consecutive_samples(self):
+        base=np.array([100,100,100],dtype=float)
+        changed=base+20
+        reads=[changed,base,changed,changed]
+        with patch.object(self.engine,'_grab_button_patch',side_effect=reads) as capture, \
+             patch.object(self.engine,'_refine_click_point') as refine, \
+             patch.object(self.engine,'_click_at') as click:
+            self.assertTrue(self.engine._confirm_seat_click(None,base,5,5,base,25,(0,0,30,30)))
+            self.assertEqual(capture.call_count,4)
+            refine.assert_not_called()
+            click.assert_not_called()
+
+    def test_nol_retry_is_single_seat_click_and_has_a_limit(self):
+        base=np.array([100,100,100],dtype=float)
+        self.engine.RETRY_WAIT=0
+        with patch.object(self.engine,'_grab_button_patch',return_value=base), \
+             patch.object(self.engine,'_refine_click_point',return_value=(9,10,None)), \
+             patch.object(self.engine,'_click_at') as click:
+            self.assertFalse(self.engine._confirm_seat_click(None,base,5,5,base,25,(0,0,30,30)))
+            self.assertEqual(click.call_count,3)
+            self.assertTrue(all(call.args==(9,10) and call.kwargs==dict(clicks=1,hover=.03) for call in click.call_args_list))
+
+    def test_nol_wait_can_be_cancelled_without_reclick(self):
+        base=np.array([100,100,100],dtype=float)
+        def cancel_after_capture(_):
+            self.engine.cancel.set()
+            return base
+        with patch.object(self.engine,'_grab_button_patch',side_effect=cancel_after_capture), \
+             patch.object(self.engine,'_click_at') as click:
+            self.assertFalse(self.engine._confirm_seat_click(None,base,5,5,base,25,(0,0,30,30)))
+            click.assert_not_called()
+
+    def test_nol_integration_waits_before_final_for_both_engines(self):
+        for method in (1,2):
+            for accepted in (True,False):
+                with self.subTest(method=method,accepted=accepted):
+                    self.configure()
+                    self.engine.site_mode='nol'
+                    self.engine.AUTO_RETRY=True
+                    self.engine.scan_method.set(method)
+                    self.engine.is_running=True
+                    self.engine.success_pending=False
+                    self.engine.cancel.clear()
+                    shot=np.zeros((30,30,4),dtype=np.uint8)
+                    shot[6:15,8:19,:3]=(30,20,10)
+                    sct=MagicMock()
+                    sct.grab.return_value=shot
+                    context=MagicMock()
+                    context.__enter__.return_value=sct
+                    self.engine.root=MagicMock()
+                    self.engine.root.winfo_screenwidth.return_value=30
+                    self.engine.root.winfo_screenheight.return_value=30
+                    rgb=Image.fromarray(shot[:,:,:3][:,:,::-1].copy())
+                    steps=[]
+                    def clicked(x,y,**kwargs):
+                        steps.append('final' if (x,y)==(100,120) else 'seat')
+                    def confirmed(*args):
+                        steps.append('confirm')
+                        return accepted
+                    with patch.object(core.mss,'mss',return_value=context), \
+                         patch.object(core.ImageGrab,'grab',return_value=rgb), \
+                         patch.object(self.engine,'_grab_button_patch',return_value=np.array([0,0,0])), \
+                         patch.object(self.engine,'_confirm_seat_click',side_effect=confirmed), \
+                         patch.object(self.engine,'_verify_and_retry') as general_retry, \
+                         patch.object(self.engine,'_click_at',side_effect=clicked), \
+                         patch.object(self.engine,'play_success_sound'):
+                        self.engine.macro_loop()
+                    self.assertEqual(steps,['seat','confirm','final'] if accepted else ['seat','confirm'])
+                    self.assertEqual(self.engine.success_pending,accepted)
+                    general_retry.assert_not_called()
+
 if __name__ == '__main__': unittest.main()

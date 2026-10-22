@@ -84,6 +84,61 @@ class MacroCore:
         except Exception:
             return ax, ay, None
 
+    def _grab_button_patch(self, sct, R=4):
+        """최종 클릭 지점 주변 작은 영역의 평균 색(BGR)을 반환. 실패 시 None."""
+        try:
+            fx, fy = int(self.final_click_pos[0]), int(self.final_click_pos[1])
+            desktop = sct.monitors[0]
+            dl, dt = desktop['left'], desktop['top']
+            dr, db = dl + desktop['width'], dt + desktop['height']
+            left, top = max(dl, fx - R), max(dt, fy - R)
+            right, bottom = min(dr, fx + R + 1), min(db, fy + R + 1)
+            if right - left < 1 or bottom - top < 1:
+                return None
+            shot = np.array(sct.grab({"left": left, "top": top,
+                                      "width": right - left, "height": bottom - top}))[:, :, :3]
+            return shot.reshape(-1, 3).astype(np.float32).mean(axis=0)
+        except Exception:
+            return None
+
+    def _button_changed(self, base, cur):
+        return cur is not None and float(np.max(np.abs(cur - base))) >= self.BTN_THRESHOLD
+
+    def _confirm_seat_click(self, sct, base, x, y, t_color, delta, bounds):
+        """좌석 클릭 직후 최종 버튼 색이 바뀔 때까지 기다린다.
+        - 바뀜(2회 연속 확인) = 좌석 클릭 반영됨 -> 즉시 반환(호출부가 최종 클릭)
+        - RETRY_WAIT 안에 안 바뀜 = 클릭 누락 -> 재조준 + 커서 올리기 + 단일 클릭으로 재시도
+        좌석 색은 보지 않으므로, 선택 후 색이 그대로인 사이트에서도 선택을 취소하지 않는다."""
+        try:
+            for attempt in range(self.RETRY_MAX + 1):
+                if self.cancel.is_set(): return False
+                end = time.monotonic() + self.RETRY_WAIT
+                streak = 0
+                while True:
+                    if self.cancel.is_set(): return False
+                    if self._button_changed(base, self._grab_button_patch(sct)):
+                        streak += 1
+                        if streak >= 2:
+                            if attempt:
+                                self.add_log(f"✅ 재시도 {attempt}회 만에 최종 버튼 활성화 확인")
+                            return True
+                    else:
+                        streak = 0
+                    if time.monotonic() >= end and streak == 0:
+                        break
+                    if self.cancel.wait(0.005): return False
+                if attempt >= self.RETRY_MAX:
+                    break
+                x, y, _ = self._refine_click_point(sct, t_color, x, y, delta, bounds)
+                self.add_log(f"🔁 최종 버튼 색 변화 없음 -> 좌석 재클릭 {attempt + 1}/{self.RETRY_MAX} ({x}, {y})")
+                self._click_at(x, y, clicks=1, hover=0.03)
+            self.add_log("⚠️ 재시도 후에도 최종 버튼 색 변화가 없습니다. 화면을 직접 확인하세요.")
+        except InterruptedError:
+            return False
+        except Exception as e:
+            self.add_log(f"⚠️ 버튼 변화 확인 중 오류: {e}")
+        return False
+
     def _seat_available(self, sct, t_color, x, y, delta, bounds, R=5):
         """클릭 지점 주변에 '선택 가능 좌석 색'이 아직 남아있는지 확인.
         판단이 불가능한 경우(오류/영역 밖)는 False -> 재시도하지 않음(안전 쪽)."""
@@ -165,7 +220,7 @@ class MacroCore:
         self.update_status("매크로 실행 중", self.clr_success)
         
         puzzle_color = np.array([241, 137, 133])
-        compiled_colors = [np.array([tc[2], tc[1], tc[0]]) for tc in self.target_colors]
+        compiled_colors = [np.array([tc[2], tc[1], tc[0]]) for tc in self.detection_colors()]
         
         mss_region = {
             "top": int(self.monitor_region[1]),
@@ -223,12 +278,21 @@ class MacroCore:
                             if self.cancel.is_set(): return
                             self.is_running, found = False, True
                             rx, ry, sz = self._refine_click_point(sct, t_color, actual_x, actual_y, delta, mss_bounds)
+                            btn_base = self._grab_button_patch(sct) if self.site_mode == 'nol' and self.AUTO_RETRY else None
+                            if self.site_mode == 'nol' and self.AUTO_RETRY and btn_base is None:
+                                self.add_log('⚠️ 최종 버튼 색을 읽지 못했습니다. 최종 클릭 위치를 다시 지정하세요.')
+                                self.update_status('최종 버튼 확인 실패', self.clr_danger)
+                                return
                             self._click_at(rx, ry, clicks=2, interval=0.001)
                             cur = pyautogui.position()
+                            if self.site_mode == 'nol' and self.AUTO_RETRY:
+                                if not self._confirm_seat_click(sct, btn_base, rx, ry, t_color, delta, mss_bounds):
+                                    self.update_status('최종 버튼 변화 미확인', self.clr_danger)
+                                    return
                             self._click_at(*self.final_click_pos)
                             react_ms = (time.time() - loop_start) * 1000
                             self.add_log(f"🖱️ 좌석 클릭 좌표: ({rx}, {ry}) / 감지점 ({actual_x}, {actual_y}) / 좌석 크기 {sz} / 클릭 직후 커서 ({cur.x}, {cur.y})")
-                            if self.AUTO_RETRY:
+                            if self.AUTO_RETRY and self.site_mode == 'general':
                                 self._verify_and_retry(sct, t_color, rx, ry, delta, mss_bounds)
                             break
                             
@@ -240,7 +304,7 @@ class MacroCore:
                         if self.cancel.is_set(): return
                         for y in range(dist, h - dist, step):
                             px = img_pil.getpixel((x, y))
-                            for t_color in self.target_colors:
+                            for t_color in self.detection_colors():
                                 if all(abs(px[i] - t_color[i]) < delta for i in range(3)):
                                     pts = [
                                         img_pil.getpixel((x-dist, y-dist)), 
@@ -250,8 +314,20 @@ class MacroCore:
                                     ]
                                     if all(all(abs(p[i]-t_color[i]) < delta for i in range(3)) for p in pts):
                                         self.is_running, found = False, True
-                                        self._click_at(self.monitor_region[0] + x, self.monitor_region[1] + y)
-                                        time.sleep(0.01)
+                                        sx, sy = self.monitor_region[0] + x, self.monitor_region[1] + y
+                                        btn_base = self._grab_button_patch(sct) if self.site_mode == 'nol' and self.AUTO_RETRY else None
+                                        if self.site_mode == 'nol' and self.AUTO_RETRY and btn_base is None:
+                                            self.add_log('⚠️ 최종 버튼 색을 읽지 못했습니다. 최종 클릭 위치를 다시 지정하세요.')
+                                            self.update_status('최종 버튼 확인 실패', self.clr_danger)
+                                            return
+                                        self._click_at(sx, sy)
+                                        if self.site_mode == 'nol' and self.AUTO_RETRY:
+                                            target_bgr = np.array([t_color[2], t_color[1], t_color[0]])
+                                            if not self._confirm_seat_click(sct, btn_base, sx, sy, target_bgr, delta, mss_bounds):
+                                                self.update_status('최종 버튼 변화 미확인', self.clr_danger)
+                                                return
+                                        else:
+                                            time.sleep(0.01)
                                         self._click_at(*self.final_click_pos)
                                         break
                             if found: break

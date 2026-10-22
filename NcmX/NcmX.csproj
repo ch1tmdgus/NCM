@@ -9,7 +9,7 @@
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <UseWinUI>true</UseWinUI>
     <DefineConstants>$(DefineConstants);DISABLE_XAML_GENERATED_MAIN</DefineConstants>
-    <Version>1.1.0</Version>
+    <Version>1.2.0</Version>
     <WindowsPackageType>None</WindowsPackageType>
     <!-- PRI/XAML publishing is required even though this app is unpackaged. -->
     <EnableMsixTooling>true</EnableMsixTooling>

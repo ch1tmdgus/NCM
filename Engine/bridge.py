@@ -13,6 +13,14 @@ from PIL import ImageGrab
 from macro_core import MacroCore
 
 
+COLOR_PRESETS = (
+    dict(id='purple', label='보라', rgb=(208, 202, 246)),
+    dict(id='green', label='초록', rgb=(185, 223, 177)),
+    dict(id='blue', label='하늘', rgb=(144, 208, 238)),
+    dict(id='brown', label='갈색', rgb=(198, 170, 160)),
+)
+PRESET_COLORS = {preset['id']: preset['rgb'] for preset in COLOR_PRESETS}
+
 _output_lock = threading.Lock()
 
 def emit(kind, **data):
@@ -44,11 +52,14 @@ class Engine(MacroCore):
         self.suppress_escape_until = 0.0
         self.monitor_region = None
         self.target_colors = []
+        self.site_mode = "general"
+        self.selected_presets = []
         self.refresh_click_pos_1 = self.refresh_click_pos_2 = None
         self.focus_click_pos = self.final_click_pos = None
         self.is_running = False
         self.refresh_count = 0
         self.SCAN_STEP, self.CHECK_DIST, self.AUTO_RETRY, self.RETRY_MAX = 3, 1, True, 3
+        self.RETRY_WAIT, self.BTN_THRESHOLD = 0.2, 12
         self.clr_primary, self.clr_success, self.clr_danger = '#4e73df', '#1cc88a', '#e74a3b'
         for name, default in dict(refresh_delay=0.2, is_random_delay=False,
                 use_custom_refresh=False, use_multi_refresh=False, no_refresh_mode=False,
@@ -57,8 +68,13 @@ class Engine(MacroCore):
 
     def add_log(self, msg): emit('log', text=time.strftime('[%H:%M:%S] ')+str(msg))
     def update_status(self, text, color): emit('status', text=text, color=color)
+    def detection_colors(self):
+        if self.site_mode == 'nol' and self.selected_presets:
+            return [PRESET_COLORS[key] for key in self.selected_presets]
+        return self.target_colors
+
     def state(self):
-        complete = bool(self.monitor_region and self.target_colors and self.final_click_pos)
+        complete = bool(self.monitor_region and self.detection_colors() and self.final_click_pos)
         complete = complete and (not self.is_yes24_mode.get() or bool(self.focus_click_pos))
         complete = complete and (not (self.use_custom_refresh.get() or self.use_multi_refresh.get()) or bool(self.refresh_click_pos_1))
         complete = complete and (not self.use_multi_refresh.get() or bool(self.refresh_click_pos_2))
@@ -68,10 +84,20 @@ class Engine(MacroCore):
         self.all_setup_notified = complete
         emit('state', busy=self.busy, region=self.monitor_region, colors=self.target_colors,
              focus=self.focus_click_pos, final=self.final_click_pos,
-             refresh1=self.refresh_click_pos_1, refresh2=self.refresh_click_pos_2)
+             refresh1=self.refresh_click_pos_1, refresh2=self.refresh_click_pos_2,
+             site_mode=self.site_mode, selected_presets=self.selected_presets,
+             active_colors=self.detection_colors())
 
     def apply_settings(self, settings):
         if self.busy: return
+        # Validate the entire mode/preset input before mutating settings.
+        mode = settings.get('site_mode', self.site_mode)
+        presets = settings.get('selected_presets', self.selected_presets)
+        if mode not in ('general', 'nol'): raise ValueError('잘못된 모드')
+        if not isinstance(presets, list) or any(not isinstance(key, str) or key not in PRESET_COLORS for key in presets):
+            raise ValueError('잘못된 색상 프리셋')
+        self.site_mode = mode
+        self.selected_presets = list(dict.fromkeys(presets))
         specs = dict(refresh_delay=(float, 0.1, 3.0), start_wait_time=(int, 0, 3), scan_method=(int, 1, 2))
         for key, value in settings.items():
             if key in specs:
@@ -138,6 +164,7 @@ class Engine(MacroCore):
                     # A one-pixel capture handles negative multi-monitor coordinates.
                     color = tuple(ImageGrab.grab(bbox=(pos[0],pos[1],pos[0]+1,pos[1]+1), all_screens=True).convert('RGB').getpixel((0,0)))
                     if color not in self.target_colors: self.target_colors.append(color)
+                    self.selected_presets = []
                 else:
                     attr = dict(focus='focus_click_pos', final='final_click_pos',
                                 refresh1='refresh_click_pos_1', refresh2='refresh_click_pos_2')[kind]
@@ -148,7 +175,7 @@ class Engine(MacroCore):
 
     def start(self, immediate=False):
         if self.busy: return
-        if not (self.monitor_region and self.target_colors and self.final_click_pos):
+        if not (self.monitor_region and self.detection_colors() and self.final_click_pos):
             emit('warning', title='필수 설정', text='감지 영역, 좌석 색상, 최종 클릭 위치를 지정하세요.'); self.state(); return
         if self.is_yes24_mode.get() and not self.focus_click_pos:
             emit('warning', title='YES24 설정', text='회차창 위치를 지정하세요.'); return
@@ -222,7 +249,7 @@ def main():
             time.sleep(0.02)
     threading.Thread(target=watch, daemon=True).start()
     engine.add_log('NCM X WinUI 3 준비 완료')
-    emit('ready')
+    emit('ready', presets=COLOR_PRESETS)
     engine.state()
     try:
         for line in sys.stdin:

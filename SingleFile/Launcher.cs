@@ -11,8 +11,8 @@ using System.Threading;
 
 [assembly: AssemblyTitle("NCM X")]
 [assembly: AssemblyProduct("NCM X")]
-[assembly: AssemblyVersion("1.1.0.0")]
-[assembly: AssemblyFileVersion("1.1.0.0")]
+[assembly: AssemblyVersion("1.2.0.0")]
+[assembly: AssemblyFileVersion("1.2.0.0")]
 
 // Only the distribution wrapper changes. The WinUI app and macro engine are unchanged.
 internal static class Launcher
@@ -20,7 +20,7 @@ internal static class Launcher
     private const string PackageId = "__PACKAGE_ID__";
     private static readonly string AppData = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "NCM_X");
     private static readonly string RuntimeRoot = Path.Combine(AppData, "Runtime");
-    private static readonly string Target = Path.Combine(RuntimeRoot, "1.1.0-" + PackageId.Substring(0, 16));
+    private static readonly string Target = Path.Combine(RuntimeRoot, "1.2.0-" + PackageId.Substring(0, 16));
     private static readonly string[] Required = { "NCM_X.exe", "NCM_X.dll", "resources.pri", "App.xbf", "Engine/NcmEngine.exe" };
 
     [STAThread]

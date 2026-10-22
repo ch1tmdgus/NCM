@@ -1,6 +1,7 @@
 using Microsoft.UI;
 using Microsoft.UI.Xaml;
 using Microsoft.UI.Xaml.Controls;
+using Microsoft.UI.Xaml.Controls.Primitives;
 using Microsoft.UI.Xaml.Input;
 using Microsoft.UI.Xaml.Automation;
 using Microsoft.UI.Xaml.Media;
@@ -33,6 +34,7 @@ public sealed class MainWindow : Window
     private readonly TextBlock status = Text("엔진 연결 중…", 22, true);
     private readonly TextBlock count = Text("작업 횟수: 0회", 14);
     private readonly TextBlock regionInfo = Text("영역을 지정하면 미리보기가 표시됩니다.", 13);
+    private Grid? previewLayout;
     private readonly Image preview = new() { Height = 150, Stretch = Stretch.Uniform };
     private readonly TextBox log = new() { IsReadOnly = true, AcceptsReturn = true,
         TextWrapping = TextWrapping.Wrap, FontFamily = new FontFamily("Consolas"), FontSize = 12,
@@ -40,6 +42,12 @@ public sealed class MainWindow : Window
     private readonly Slider delay = new() { Minimum = .1, Maximum = 3, StepFrequency = .1, Value = .2 };
     private readonly TextBlock delayLabel = Text("새로고침 대기 · 0.2초", 13);
     private readonly ComboBox wait = new() { HorizontalAlignment = HorizontalAlignment.Stretch };
+    private readonly ComboBox siteMode = new() { HorizontalAlignment = HorizontalAlignment.Stretch };
+    private readonly TextBlock modeDescription = Text("좌석 색 변화를 확인하는 기존 재클릭 방식을 사용합니다.", 12);
+    private readonly StackPanel presetPanel = new() { Spacing = 6, Visibility = Visibility.Collapsed };
+    private readonly StackPanel presetButtons = new() { Orientation = Orientation.Horizontal, Spacing = 6 };
+    private readonly TextBlock colorSource = Text("직접 지정한 색상 사용", 12);
+    private readonly Dictionary<string, ToggleButton> presetChoices = new();
     private readonly ComboBox method = new() { HorizontalAlignment = HorizontalAlignment.Stretch };
     private readonly Button start = new() { Content = "매크로 시작", HorizontalAlignment = HorizontalAlignment.Stretch, IsEnabled = false };
     private readonly Button stop = new() { Content = "중지 · ESC", HorizontalAlignment = HorizontalAlignment.Stretch };
@@ -106,6 +114,47 @@ public sealed class MainWindow : Window
             }
             catch (Exception ex) { status.Text = "엔진 연결 실패"; ShowWarning("실행 오류", ex.Message); }
         };
+    }
+
+    private async Task CheckNolUI()
+    {
+        var originalSize = AppWindow.Size;
+        try {
+            await Task.Delay(700); // Let the independent native-resize smoke check finish first.
+            if (presetChoices.Count != 4) throw new InvalidOperationException("프리셋 개수 오류");
+            siteMode.SelectedIndex = 1;
+            presetChoices["purple"].IsChecked = presetChoices["green"].IsChecked = true;
+            UpdateModeUI(); await SendSettings();
+            await Task.Delay(150);
+            if (presetPanel.Visibility != Visibility.Visible || presetChoices.Count(p => p.Value.IsChecked == true) != 2)
+                throw new InvalidOperationException("NOL 복수 선택 오류");
+            double dpi = GetDpiForWindow(WinRT.Interop.WindowNative.GetWindowHandle(this)) / 96.0;
+            AppWindow.Resize(new Windows.Graphics.SizeInt32((int)(840 * dpi), (int)(720 * dpi)));
+            navigation.SelectedItem = navigation.MenuItems[1];
+            toggles["is_yes24_mode"].IsOn = true;
+            toggles["use_multi_refresh"].IsOn = true;
+            await Task.Delay(200); root.UpdateLayout();
+            double waitBottom = wait.TransformToVisual(settingsHost).TransformPoint(new Windows.Foundation.Point(0, wait.ActualHeight)).Y;
+            double pickBottom = picks["refresh2"].TransformToVisual(settingsHost).TransformPoint(new Windows.Foundation.Point(0, picks["refresh2"].ActualHeight)).Y;
+            if (waitBottom > settingsHost.ActualHeight + 1 || pickBottom > settingsHost.ActualHeight + 1)
+                throw new InvalidOperationException($"설정 영역 넘침: {waitBottom}/{pickBottom}/{settingsHost.ActualHeight}");
+            preview.Source = new WriteableBitmap(320, 180); // Simulate an actual captured region, without screen capture.
+            navigation.SelectedItem = navigation.MenuItems[0];
+            await Task.Delay(200); root.UpdateLayout();
+            double previewHeight = previewLayout!.RowDefinitions[1].ActualHeight;
+            if (previewHeight < 60 || presetButtons.ActualWidth > presetPanel.ActualWidth + 1)
+                throw new InvalidOperationException($"NOL 홈 영역 넘침: preview={previewHeight:F1}; presets={presetButtons.ActualWidth:F1}/{presetPanel.ActualWidth:F1}");
+            siteMode.SelectedIndex = 0; UpdateModeUI();
+            if (presetPanel.Visibility != Visibility.Collapsed) throw new InvalidOperationException("일반 모드 전환 오류");
+            siteMode.SelectedIndex = 1;
+            if (presetChoices.Count(p => p.Value.IsChecked == true) != 2) throw new InvalidOperationException("프리셋 선택 보존 오류");
+            foreach (var pair in presetChoices) pair.Value.IsChecked = false;
+            siteMode.SelectedIndex = 0;
+            toggles["is_yes24_mode"].IsOn = toggles["use_multi_refresh"].IsOn = false;
+            UpdateModeUI(); await SendSettings();
+            StartupDiagnostics.Write($"NOL mode and multi-preset UI self-test: PASS; settings={waitBottom:F1}/{pickBottom:F1}; available={settingsHost.ActualHeight:F1}; preview={previewHeight:F1}");
+        } catch (Exception ex) { StartupDiagnostics.Write("NOL UI self-test: FAIL " + ex); }
+        finally { preview.Source = null; AppWindow.Resize(originalSize); }
     }
 
     private void BuildWindowChrome()
@@ -273,14 +322,18 @@ public sealed class MainWindow : Window
         var left = new Grid { RowSpacing = 16 };
         left.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         left.RowDefinitions.Add(new RowDefinition());
+        presetPanel.Children.Add(colorSource);
+        presetPanel.Children.Add(presetButtons);
+        ToolTipService.SetToolTip(presetPanel, "여러 색상을 선택할 수 있습니다. 선택한 프리셋이 직접 지정 색상을 대체하며, 모두 해제하면 직접 지정 색상을 사용합니다.");
         var primaryButtons = Stack(Pick("region", "영역 설정 · A → B"), Pick("color", "좌석 색상 추가 · A"),
-            Pick("final", "최종 클릭 위치 · A"), colors,
-            Text("위치를 가리키고 A · 영역 끝점 B · 취소 ESC", 12));
+            Pick("final", "최종 클릭 위치 · A"), colors, presetPanel,
+            Text("A 지정 · B 영역 끝 · ESC 취소", 12));
         primaryButtons.Spacing = 8;
         left.Children.Add(Card("위치 지정", primaryButtons));
         preview.Height = double.NaN;
         preview.VerticalAlignment = VerticalAlignment.Stretch;
         var previewBody = new Grid { RowSpacing = 8 };
+        previewLayout = previewBody;
         previewBody.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
         previewBody.RowDefinitions.Add(new RowDefinition());
         previewBody.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
@@ -326,6 +379,20 @@ public sealed class MainWindow : Window
         method.SelectedIndex = 0;
         method.SelectionChanged += async (_, _) => { if (!updating) await SendSettings(); };
         AutomationProperties.SetName(method, "감지 엔진");
+        siteMode.Items.Add("일반 모드");
+        siteMode.Items.Add("NOL 모드");
+        siteMode.SelectedIndex = 0;
+        AutomationProperties.SetName(siteMode, "사용 모드");
+        siteMode.SelectionChanged += async (_, _) => {
+            UpdateModeUI();
+            if (!updating) await SendSettings();
+        };
+        if (speedCard.Child is StackPanel speedContent) {
+            speedContent.Spacing = 8;
+            speedContent.Children.Insert(1, Text("사용 모드", 13));
+            speedContent.Children.Insert(2, siteMode);
+            speedContent.Children.Insert(3, modeDescription);
+        }
         var modeCard = Card("동작 모드", Text("감지 엔진", 13), method,
             Option("is_yes24_mode", "YES24 · 방향키 새로고침"),
             Option("use_custom_refresh", "단일 위치 새로고침"),
@@ -377,11 +444,36 @@ public sealed class MainWindow : Window
         var values = toggles.ToDictionary(pair => pair.Key, pair => (object)pair.Value.IsOn);
         values["refresh_delay"] = delay.Value;
         values["start_wait_time"] = Math.Max(0, wait.SelectedIndex);
+        values["site_mode"] = siteMode.SelectedIndex == 1 ? "nol" : "general";
+        values["selected_presets"] = presetChoices.Where(pair => pair.Value.IsChecked == true).Select(pair => pair.Key).ToArray();
         values["scan_method"] = Math.Max(0, method.SelectedIndex) + 1;
         return engine.SendAsync(new { action = "settings", settings = values });
     }
+    private void BuildColorPresets(JsonElement presets)
+    {
+        presetChoices.Clear(); presetButtons.Children.Clear();
+        foreach (var preset in presets.EnumerateArray()) {
+            string id = preset.GetProperty("id").GetString()!;
+            string name = preset.GetProperty("label").GetString()!;
+            int[] rgb = preset.GetProperty("rgb").EnumerateArray().Select(c => c.GetInt32()).ToArray();
+            var content = new StackPanel { Spacing = 2, HorizontalAlignment = HorizontalAlignment.Center };
+            content.Children.Add(new Border { Width = 24, Height = 8, CornerRadius = new CornerRadius(3),
+                Background = new SolidColorBrush(Windows.UI.Color.FromArgb(255,(byte)rgb[0],(byte)rgb[1],(byte)rgb[2])) });
+            content.Children.Add(Text(name, 11));
+            var choice = new ToggleButton { Content = content, Width = 50, Height = 36, Padding = new Thickness(4) };
+            AutomationProperties.SetName(choice, "NOL " + name + " 프리셋");
+            ToolTipService.SetToolTip(choice, $"{name} · #{rgb[0]:X2}{rgb[1]:X2}{rgb[2]:X2} · 복수 선택 가능");
+            choice.Click += async (_, _) => { UpdateModeUI(); if (!updating) await SendSettings(); };
+            presetChoices[id] = choice; presetButtons.Children.Add(choice);
+        }
+    }
     private void UpdateModeUI()
     {
+        bool nol = siteMode.SelectedIndex == 1;
+        presetPanel.Visibility = nol ? Visibility.Visible : Visibility.Collapsed;
+        modeDescription.Text = nol ? "최종 버튼 색 변화로 좌석 클릭 반영을 확인합니다." : "기존 좌석 색 기반 재클릭 방식을 사용합니다.";
+        int selected = presetChoices.Count(pair => pair.Value.IsChecked == true);
+        colorSource.Text = selected > 0 ? $"NOL 프리셋 · {selected}개 사용 중" : "NOL 프리셋 · 복수 선택";
         if (!toggles.ContainsKey("is_yes24_mode")) return;
         bool multi = toggles["use_multi_refresh"].IsOn;
         picks["focus"].Visibility = toggles["is_yes24_mode"].IsOn ? Visibility.Visible : Visibility.Collapsed;
@@ -403,7 +495,10 @@ public sealed class MainWindow : Window
     {
         switch (message.GetProperty("type").GetString()) {
             case "ready":
-                ready = true; StartupDiagnostics.Write("Engine ready handshake received"); status.Text = "대기 중"; UpdateEnabled(); _ = SendSettings(); break;
+                BuildColorPresets(message.GetProperty("presets"));
+                ready = true; StartupDiagnostics.Write("Engine ready handshake received"); status.Text = "대기 중"; UpdateEnabled(); _ = SendSettings();
+                if (Environment.GetCommandLineArgs().Contains("--test-nol-ui")) _ = CheckNolUI();
+                break;
             case "log": AddLog(message.GetProperty("text").GetString()!); break;
             case "status":
                 status.Text = message.GetProperty("text").GetString()!;
@@ -413,7 +508,14 @@ public sealed class MainWindow : Window
                 break;
             case "count": count.Text = message.GetProperty("text").GetString(); break;
             case "state":
+                bool wasBusy = busy;
                 busy = message.GetProperty("busy").GetBoolean();
+                if (wasBusy && !busy) {
+                    // A completed direct color capture switches back to manually sampled colors.
+                    var selected = message.GetProperty("selected_presets").EnumerateArray().Select(value => value.GetString()).ToHashSet();
+                    foreach (var pair in presetChoices) pair.Value.IsChecked = selected.Contains(pair.Key);
+                    UpdateModeUI();
+                }
                 if (!busy) pickerOverlay.Hide();
                 regionInfo.Text = "감지 영역: " + message.GetProperty("region").ToString();
                 SetPick("region", "감지 영역 · A → B", message.GetProperty("region"));
